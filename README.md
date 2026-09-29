@@ -21,7 +21,8 @@ itself needs no modification.
 
 Token usage is accounted for on both of Ollama's dialects: the native
 `/api/generate` and `/api/chat` endpoints, and the OpenAI-compatible
-`/v1/chat/completions` and `/v1/completions` endpoints. All other paths are
+`/v1/chat/completions` and `/v1/completions` endpoints, and the Anthropic-compatible
+`/v1/messages` endpoint (what Claude Code speaks). All other paths are
 proxied through unchanged, with request duration recorded.
 
 ## Features
@@ -173,6 +174,12 @@ scraped series, and a collision makes Prometheus rename the app's label to
   than the whole request. Prompt evaluation of a large context can dwarf
   generation, which would make a whole-request figure meaningless; for
   non-streaming `/v1` the metric is skipped rather than recorded wrongly.
+- **Anthropic-compatible `/v1/messages`** — usage always arrives, streamed or
+  not, so nothing is injected and the response passes untouched. The prompt
+  count is `input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens`, since `input_tokens` excludes cached tokens.
+  When streaming, Ollama's `message_start` carries a placeholder input count
+  that `message_delta` corrects, so the last non-zero value wins.
 - `ollama_time_to_first_token_seconds` is recorded for streaming requests only.
 
 ## Prometheus & Grafana Setup
