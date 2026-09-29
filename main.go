@@ -486,6 +486,56 @@ func (s *requestStats) observeOpenAIUsage(res *openAIResponse) {
 	}
 }
 
+// anthropicUsage is the usage object of the Anthropic Messages dialect.
+// input_tokens excludes cached tokens, so the prompt is the sum of all three.
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
+// anthropicEvent covers a /v1/messages body and each of its stream events:
+// a body carries model and usage at the top, message_start inside "message",
+// and message_delta carries the final usage at the top.
+type anthropicEvent struct {
+	Type    string          `json:"type"`
+	Model   string          `json:"model"`
+	Usage   *anthropicUsage `json:"usage"`
+	Message *struct {
+		Model string          `json:"model"`
+		Usage *anthropicUsage `json:"usage"`
+	} `json:"message"`
+}
+
+// observeAnthropic picks up the model name and token counts from a
+// /v1/messages body or stream event. Later events win, but only with non-zero
+// values: message_start announces a placeholder input count that Ollama
+// corrects in message_delta, while Anthropic's own message_delta omits input.
+func (s *requestStats) observeAnthropic(ev *anthropicEvent) {
+	usage := ev.Usage
+	if ev.Message != nil {
+		if ev.Message.Model != "" {
+			s.model = ensureModelTag(ev.Message.Model)
+		}
+		if usage == nil {
+			usage = ev.Message.Usage
+		}
+	}
+	if ev.Model != "" {
+		s.model = ensureModelTag(ev.Model)
+	}
+	if usage == nil {
+		return
+	}
+	if p := usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens; p > 0 {
+		s.promptCount = p
+	}
+	if usage.OutputTokens > 0 {
+		s.generatedCount = usage.OutputTokens
+	}
+}
+
 // record emits the metrics for a finished request.
 func (s *requestStats) record(path string) {
 	if s.model == "" {
@@ -591,6 +641,42 @@ func streamNative(w http.ResponseWriter, body io.Reader, st *requestStats, sanit
 // usage on the way. When dropInjectedUsage is set the usage event we asked for
 // on the client's behalf is withheld, so client-visible output is unchanged.
 func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropInjectedUsage, sanitizeUTF8Responses bool, method, path string) {
+	relaySSE(w, body, sanitizeUTF8Responses, method, path, func(data []byte) bool {
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return true
+		}
+		var chunk openAIResponse
+		if json.Unmarshal(data, &chunk) != nil {
+			return true
+		}
+		st.observeOpenAIUsage(&chunk)
+		if chunk.hasContent() {
+			st.markToken()
+		}
+		// Ollama sends usage in a final event with no choices.
+		return !(dropInjectedUsage && chunk.Usage != nil && len(chunk.Choices) == 0)
+	})
+}
+
+// streamAnthropic forwards a /v1/messages SSE response untouched, collecting
+// the model and token usage from its events on the way.
+func streamAnthropic(w http.ResponseWriter, body io.Reader, st *requestStats, sanitizeUTF8Responses bool, method, path string) {
+	relaySSE(w, body, sanitizeUTF8Responses, method, path, func(data []byte) bool {
+		var ev anthropicEvent
+		if json.Unmarshal(data, &ev) == nil {
+			st.observeAnthropic(&ev)
+			if ev.Type == "content_block_delta" {
+				st.markToken()
+			}
+		}
+		return true
+	})
+}
+
+// relaySSE forwards an SSE stream line by line, flushing each one, and hands
+// every data payload to onData, which returns false to withhold that event
+// (its data line and the blank line ending it) from the client.
+func relaySSE(w http.ResponseWriter, body io.Reader, sanitizeUTF8Responses bool, method, path string, onData func(data []byte) bool) {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(body)
 	pendingBlank := false // the blank line terminating a withheld event
@@ -600,24 +686,12 @@ func streamOpenAI(w http.ResponseWriter, body io.Reader, st *requestStats, dropI
 			if sanitizeUTF8Responses {
 				line = sanitizeUTF8(line)
 			}
-			// Log every upstream line, including usage events withheld from the client.
+			// Log every upstream line, including events withheld from the client.
 			logDebugBody("output", method, path, line)
 			forward := true
 			switch data, isData := sseData(line); {
 			case isData:
-				if !bytes.Equal(data, []byte("[DONE]")) {
-					var chunk openAIResponse
-					if json.Unmarshal(data, &chunk) == nil {
-						st.observeOpenAIUsage(&chunk)
-						if chunk.hasContent() {
-							st.markToken()
-						}
-						// Ollama sends usage in a final event with no choices.
-						if dropInjectedUsage && chunk.Usage != nil && len(chunk.Choices) == 0 {
-							forward = false
-						}
-					}
-				}
+				forward = onData(data)
 				pendingBlank = !forward
 			case pendingBlank && len(bytes.TrimSpace(line)) == 0:
 				forward = false
@@ -856,6 +930,28 @@ func newMuxWithConfig(upstreamAddr string, cfg proxyConfig) *http.ServeMux {
 				} else {
 					log.Printf("WARNING: Failed to parse %s response: %v", r.URL.Path, err)
 				}
+			}
+		case r.URL.Path == "/v1/messages":
+			// Anthropic Messages dialect: usage always arrives, streamed or not,
+			// so there is nothing to inject and the response passes untouched.
+			st.streaming = strings.HasPrefix(respUp.Header.Get("Content-Type"), "text/event-stream")
+			if st.streaming {
+				streamAnthropic(w, respUp.Body, st, cfg.sanitizeUTF8Responses, r.Method, r.URL.Path)
+			} else {
+				bodyData, _ := io.ReadAll(respUp.Body)
+				if cfg.sanitizeUTF8Responses {
+					bodyData = sanitizeUTF8(bodyData)
+				}
+				logDebugBody("output", r.Method, r.URL.Path, bodyData)
+				w.Write(bodyData)
+				var ev anthropicEvent
+				if json.Unmarshal(bodyData, &ev) == nil {
+					st.observeAnthropic(&ev)
+				}
+			}
+			// An error body names no model; fall back to the request's.
+			if m, ok := reqJSON["model"].(string); ok && st.model == "" {
+				st.model = ensureModelTag(m)
 			}
 		default:
 			// Other endpoints (e.g. /api/tags, /api/pull) - just copy through

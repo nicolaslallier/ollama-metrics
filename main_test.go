@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,6 +92,32 @@ func nativeChatBody(model string) string {
 	}, "\n") + "\n"
 }
 
+// anthropicStream is a /v1/messages stream as Ollama sends it: message_start
+// announces a placeholder input count, and message_delta carries the real one.
+func anthropicStream(model string) string {
+	events := []struct{ name, data string }{
+		{"message_start", fmt.Sprintf(`{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":%q,"content":[],"usage":{"input_tokens":2,"output_tokens":0}}}`, model)},
+		{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}`},
+		{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}`},
+		{"content_block_stop", `{"type":"content_block_stop","index":0}`},
+		{"message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":%d,"cache_read_input_tokens":0,"output_tokens":%d}}`, stubPromptTokens, stubGeneratedTokens)},
+		{"message_stop", `{"type":"message_stop"}`},
+	}
+	var b strings.Builder
+	for _, e := range events {
+		fmt.Fprintf(&b, "event: %s\ndata: %s\n\n", e.name, e.data)
+	}
+	return b.String()
+}
+
+// anthropicBody is a non-streamed /v1/messages reply. Part of the prompt was a
+// cache hit, which input_tokens leaves out.
+func anthropicBody(model string) string {
+	return fmt.Sprintf(`{"id":"msg_1","type":"message","role":"assistant","model":%q,"content":[{"type":"text","text":"Hi there"}],"usage":{"input_tokens":%d,"cache_read_input_tokens":%d,"output_tokens":%d}}`,
+		model, stubPromptTokens-6, 6, stubGeneratedTokens)
+}
+
 func newStubUpstream(t *testing.T) *stubUpstream {
 	t.Helper()
 	stub := &stubUpstream{}
@@ -155,6 +182,18 @@ func newStubUpstream(t *testing.T) *stubUpstream {
 	}
 	mux.HandleFunc("/v1/chat/completions", completions)
 	mux.HandleFunc("/v1/completions", completions)
+
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		body := stub.record(r)
+		model, _ := requestField(body, "model").(string)
+		if stream, _ := requestField(body, "stream").(bool); !stream {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, anthropicBody(model))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeChunked(w, strings.SplitAfter(anthropicStream(model), "\n\n"))
+	})
 
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r)
@@ -649,6 +688,87 @@ func TestOpenAILegacyCompletions(t *testing.T) {
 	}
 	if v := mustSample(t, metrics, "ollama_request_duration_seconds_count", `api_endpoint="v1/completions"`, `model="`+tagged+`"`); v != 1 {
 		t.Errorf("request duration count = %v, want 1", v)
+	}
+}
+
+// TestAnthropicStreaming covers /v1/messages as Claude Code uses it: the stream
+// reaches the client verbatim, and the counts come from message_delta rather
+// than message_start's placeholder.
+func TestAnthropicStreaming(t *testing.T) {
+	proxy, stub := newProxy(t)
+	const model = "anthropic-stream"
+	tagged := model + ":latest"
+
+	got := post(t, proxy, "/v1/messages?beta=true",
+		fmt.Sprintf(`{"model":%q,"max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, model), nil)
+
+	if want := anthropicStream(model); got != want {
+		t.Errorf("client saw a modified stream:\n got: %q\nwant: %q", got, want)
+	}
+	// Nothing is injected into this dialect.
+	up := stub.lastRequest(t, "/v1/messages")
+	if requestField(up.body, "stream_options") != nil {
+		t.Errorf("stream_options injected into /v1/messages: %s", up.body)
+	}
+
+	metrics := scrape(t, proxy)
+	if v := mustSample(t, metrics, "ollama_prompt_tokens_total", `model="`+tagged+`"`); v != stubPromptTokens {
+		t.Errorf("prompt tokens = %v, want %v (message_start's placeholder must not win)", v, stubPromptTokens)
+	}
+	if v := mustSample(t, metrics, "ollama_generated_tokens_total", `model="`+tagged+`"`); v != stubGeneratedTokens {
+		t.Errorf("generated tokens = %v, want %v", v, stubGeneratedTokens)
+	}
+	if v := mustSample(t, metrics, "ollama_request_duration_seconds_count", `api_endpoint="v1/messages"`, `model="`+tagged+`"`); v != 1 {
+		t.Errorf("request duration count = %v, want 1", v)
+	}
+	if v := mustSample(t, metrics, "ollama_time_to_first_token_seconds_count", `api_endpoint="v1/messages"`, `model="`+tagged+`"`); v != 1 {
+		t.Errorf("time to first token count = %v, want 1", v)
+	}
+	if v := mustSample(t, metrics, "ollama_time_per_token_seconds_count", `model="`+tagged+`"`); v != 1 {
+		t.Errorf("time per token count = %v, want 1", v)
+	}
+}
+
+// TestAnthropicNonStreaming reads usage from the body, counting cached prompt
+// tokens too, and records no stream-only timings.
+func TestAnthropicNonStreaming(t *testing.T) {
+	proxy, _ := newProxy(t)
+	const model = "anthropic-blocking"
+	tagged := model + ":latest"
+
+	got := post(t, proxy, "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":100,"messages":[]}`, model), nil)
+	if want := anthropicBody(model); got != want {
+		t.Errorf("non-streaming body was not forwarded intact:\n got: %q\nwant: %q", got, want)
+	}
+
+	metrics := scrape(t, proxy)
+	if v := mustSample(t, metrics, "ollama_prompt_tokens_total", `model="`+tagged+`"`); v != stubPromptTokens {
+		t.Errorf("prompt tokens = %v, want %v (input + cache read)", v, stubPromptTokens)
+	}
+	if v := mustSample(t, metrics, "ollama_generated_tokens_total", `model="`+tagged+`"`); v != stubGeneratedTokens {
+		t.Errorf("generated tokens = %v, want %v", v, stubGeneratedTokens)
+	}
+	requireAbsent(t, metrics, "ollama_time_per_token_seconds_count", `model="`+tagged+`"`)
+	requireAbsent(t, metrics, "ollama_time_to_first_token_seconds_count", `model="`+tagged+`"`)
+}
+
+// TestObserveAnthropicKeepsInputWhenDeltaOmitsIt covers Anthropic's own
+// convention, where message_delta reports output only: the input count from
+// message_start must survive it.
+func TestObserveAnthropicKeepsInputWhenDeltaOmitsIt(t *testing.T) {
+	var st requestStats
+	for _, ev := range []string{
+		`{"type":"message_start","message":{"model":"m","usage":{"input_tokens":40,"cache_read_input_tokens":2,"output_tokens":1}}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}`,
+	} {
+		var parsed anthropicEvent
+		if err := json.Unmarshal([]byte(ev), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		st.observeAnthropic(&parsed)
+	}
+	if st.model != "m:latest" || st.promptCount != 42 || st.generatedCount != 9 {
+		t.Errorf("got model=%q prompt=%d generated=%d, want m:latest 42 9", st.model, st.promptCount, st.generatedCount)
 	}
 }
 
